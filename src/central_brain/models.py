@@ -18,6 +18,7 @@ class MemoryType(str, Enum):
     PREFERENCE = "preference"
     TODO = "todo"
     OPEN_LOOP = "open_loop"
+    USER_INSTRUCTION = "user_instruction"
 
 
 class MemorySource(str, Enum):

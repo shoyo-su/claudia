@@ -206,8 +206,8 @@ def hook_session_start():
         "  Then wait for their pick.\n\n"
         f"- Handle picks: 1 → call `recall_frequent` tier=\"top\" project=\"{project}\" | "
         f"2 → call `recall` memory_type=\"open_loop\" project=\"{project}\" | "
-        f"3 → ask keyword, then call `recall` with project=\"{project}\"\n"
-        "- IMPORTANT: Always pass project=\"" + project + "\" to every recall/recall_frequent call.\n"
+        f"3 → ask keyword, then call `recall` with query=<keyword> limit=1 (NO project filter — search whole DB). Show the single best match and ask \"Should I load this memory?\". If user says yes, present the full memory. If no, offer to search again with a different keyword.\n"
+        f"- IMPORTANT: Always pass project=\"{project}\" to recall_frequent (option 1) and recall (option 2) calls.\n"
         "- If the user does NOT say \"claudia\", behave completely normally. "
         "Do not mention memories, do not show this menu, do not load any context."
     )

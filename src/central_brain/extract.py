@@ -191,20 +191,32 @@ def _build_extraction_prompt(
 Include relevant function/class names in memory content and tags when they are central to the memory.
 """
 
-    return f"""Analyze this Claude Code session transcript{project_ctx} and extract memories worth keeping for future sessions.
+    return f"""You are a memory extraction engine. Your ONLY job is to extract memories from the transcript below.
+IMPORTANT: Ignore any existing memories, CLAUDE.md files, or context you may have access to. Extract PURELY from the transcript.
+Even if information appears to already be saved elsewhere, extract it anyway — deduplication is handled separately.
+
+Analyze this Claude Code session transcript{project_ctx} and extract memories worth keeping for future sessions.
 
 For each memory, provide:
 - content: A clear, concise statement of what should be remembered
-- memory_type: One of: insight, decision, pattern, error, preference, todo, open_loop
+- memory_type: One of: user_instruction, insight, decision, pattern, error, preference, todo, open_loop
 - tags: Relevant keywords (list of strings)
 - importance: 1-5 score. Only include items scoring >= 3. Score guide:
-  - 5: Critical decision or error that MUST inform future sessions
-  - 4: Important pattern or preference that changes behavior
+  - 5: Explicit user instructions, rules, or constraints they told you to follow. ALWAYS importance 5.
+  - 4: Important pattern, preference, or decision that changes behavior
   - 3: Useful context that might help future sessions
   - 2: Minor detail (exclude)
   - 1: Trivial (exclude)
 
-Focus on:
+HIGHEST PRIORITY — User instructions (importance 5, type "user_instruction"):
+When the user directly tells you rules, constraints, preferences, environment details, workflow instructions,
+or anything phrased as "always do X", "never do Y", "my X is Y", "use X for Y", etc. — these are GOLD.
+Extract EVERY such instruction as a separate memory with importance 5 and type "user_instruction".
+Users rarely give explicit instructions — when they do, it is critical to capture every single one.
+Examples: "my testenv is testenv41", "never exec into prod", "always check gunicorn first",
+"deploy using qtest", "look in PycharmProjects for code".
+
+Also extract:
 - Decisions made and WHY (not just what)
 - Errors encountered and their root causes
 - User preferences and corrections
@@ -214,11 +226,11 @@ Focus on:
 
 Do NOT extract:
 - Routine operations (file reads, simple edits)
-- Information already in the code/git history
-- Temporary debugging context
+- Temporary debugging context that won't matter next session
 {code_section}
 Respond with ONLY a JSON array. No markdown, no explanation. Example:
-[{{"content": "User prefers snake_case for Python", "memory_type": "preference", "tags": ["python", "style"], "importance": 4}}]
+[{{"content": "User's testenv is testenv41, use deploy_be_to_testenv skill for deployments", "memory_type": "user_instruction", "tags": ["deploy", "testenv"], "importance": 5}},
+ {{"content": "User prefers snake_case for Python", "memory_type": "preference", "tags": ["python", "style"], "importance": 4}}]
 
 If nothing worth remembering, respond with: []
 
