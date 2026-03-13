@@ -23,7 +23,7 @@ This handles everything: installs `uv` if needed, finds Python 3.11+, installs `
 Also works via curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ajitesh-bhalerao/central-brain/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shoyo-su/claudia/main/install.sh | bash
 ```
 
 ### Manual Install

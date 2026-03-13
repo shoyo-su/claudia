@@ -37,7 +37,7 @@ if [[ ! -f "$SCRIPT_DIR/pyproject.toml" ]]; then
     TMPDIR="$(mktemp -d)"
     trap 'rm -rf "$TMPDIR"' EXIT
     info "Cloning central-brain repo to $TMPDIR ..."
-    git clone --depth 1 https://github.com/ajitesh-bhalerao/central-brain.git "$TMPDIR/central-brain"
+    git clone --depth 1 https://github.com/shoyo-su/claudia.git "$TMPDIR/central-brain"
     SCRIPT_DIR="$TMPDIR/central-brain"
 fi
 
