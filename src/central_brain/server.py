@@ -8,6 +8,7 @@ from central_brain.db import (
     DEFAULT_DB_PATH,
     delete_memory,
     get_db,
+    get_frequent_memories,
     get_memory,
     get_stats,
     init_db,
@@ -113,6 +114,43 @@ def recall(
             "created_at": str(r.memory.created_at) if r.memory.created_at else None,
         }
         for r in results
+    ]
+
+
+@mcp.tool()
+def recall_frequent(
+    tier: str = "top",
+    project: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Recall most frequently accessed memories, paginated by tier.
+
+    Args:
+        tier: "top" for most accessed, "second" for the next batch
+        project: Filter to specific project
+        limit: Max results per tier
+    """
+    conn = _get_conn()
+    memories = get_frequent_memories(conn, tier=tier, project=project, limit=limit)
+    # Bump access counts
+    for m in memories:
+        conn.execute(
+            "UPDATE memories SET access_count = access_count + 1 WHERE id = ?",
+            (m.id,),
+        )
+    conn.commit()
+    return [
+        {
+            "id": m.id,
+            "content": m.content,
+            "memory_type": m.memory_type.value,
+            "project": m.project,
+            "tags": m.tags,
+            "importance": m.importance,
+            "access_count": m.access_count,
+            "created_at": str(m.created_at) if m.created_at else None,
+        }
+        for m in memories
     ]
 
 

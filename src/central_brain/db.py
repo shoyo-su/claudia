@@ -435,6 +435,85 @@ def update_session_memory_count(conn: sqlite3.Connection, session_id: str) -> No
     conn.commit()
 
 
+# --- Session start helpers ---
+
+def _snippet(content: str, max_len: int = 40) -> str:
+    """Truncate content to a short snippet."""
+    content = content.replace("\n", " ").strip()
+    return content[:max_len] + "…" if len(content) > max_len else content
+
+
+def get_session_start_summary(conn: sqlite3.Connection, project: str | None = None) -> dict[str, Any]:
+    """Lightweight counts + previews + critical memories — all scoped to project."""
+    base = "WHERE superseded_by IS NULL"
+    pf = f"{base} AND project = ?" if project else base
+    pp = (project,) if project else ()
+
+    project_memory_count = conn.execute(
+        f"SELECT COUNT(*) FROM memories {pf}", pp,
+    ).fetchone()[0]
+
+    open_loop_count = conn.execute(
+        f"SELECT COUNT(*) FROM memories {pf} AND memory_type = 'open_loop'", pp,
+    ).fetchone()[0]
+
+    high_importance_count = conn.execute(
+        f"SELECT COUNT(*) FROM memories {pf} AND importance >= 4", pp,
+    ).fetchone()[0]
+
+    total_memories = project_memory_count  # scoped to project
+
+    # Only importance=5 (critical), max 3 — project-scoped
+    critical_rows = conn.execute(
+        f"SELECT * FROM memories {pf} AND importance = 5 ORDER BY updated_at DESC LIMIT 3", pp,
+    ).fetchall()
+
+    # Previews: top 3 snippets per category — all project-scoped
+    top_accessed = conn.execute(
+        f"SELECT content FROM memories {pf} ORDER BY access_count DESC LIMIT 3", pp,
+    ).fetchall()
+
+    open_loop_previews = conn.execute(
+        f"SELECT content FROM memories {pf} AND memory_type = 'open_loop' ORDER BY updated_at DESC LIMIT 3", pp,
+    ).fetchall()
+
+    return {
+        "project_memory_count": project_memory_count,
+        "open_loop_count": open_loop_count,
+        "high_importance_count": high_importance_count,
+        "total_memories": total_memories,
+        "critical_memories": [_row_to_memory(r) for r in critical_rows],
+        "top_accessed_previews": [_snippet(r["content"]) for r in top_accessed],
+        "open_loop_previews": [_snippet(r["content"]) for r in open_loop_previews],
+    }
+
+
+def get_frequent_memories(
+    conn: sqlite3.Connection,
+    tier: str = "top",
+    project: str | None = None,
+    limit: int = 10,
+) -> list[Memory]:
+    """Memories sorted by access_count DESC, paginated by tier."""
+    offset = 0 if tier == "top" else limit
+
+    conditions = ["superseded_by IS NULL"]
+    params: list[Any] = []
+    if project:
+        conditions.append("project = ?")
+        params.append(project)
+
+    where = " AND ".join(conditions)
+    params.extend([limit, offset])
+
+    rows = conn.execute(
+        f"SELECT * FROM memories WHERE {where} ORDER BY access_count DESC LIMIT ? OFFSET ?",
+        params,
+    ).fetchall()
+
+    return [_row_to_memory(r) for r in rows]
+
+
 # --- Stats ---
 
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:

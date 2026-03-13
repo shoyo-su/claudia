@@ -13,6 +13,7 @@ from pathlib import Path
 from central_brain.db import (
     DEFAULT_DB_PATH,
     get_db,
+    get_session_start_summary,
     init_db,
     insert_memory,
     store_embedding,
@@ -22,7 +23,7 @@ from central_brain.db import (
 from central_brain.embedder import get_embedder
 from central_brain.extract import extract_memories_via_llm, parse_transcript
 from central_brain.models import Memory, MemorySource, Session
-from central_brain.search import hybrid_search, fts5_search
+from central_brain.search import hybrid_search
 
 
 def main():
@@ -148,10 +149,11 @@ def cmd_backfill_embeddings():
 
 
 def hook_session_start():
-    """SessionStart hook — inject relevant memories as additionalContext.
+    """SessionStart hook — present context menu instead of auto-loading all memories.
 
     Reads hook input from stdin (JSON with session info).
-    Outputs JSON with additionalContext field.
+    Outputs JSON with additionalContext containing a lightweight menu
+    that lets the user choose what context to load.
     """
     # Parse hook input
     try:
@@ -175,58 +177,47 @@ def hook_session_start():
     )
     upsert_session(conn, session)
 
-    # Search for relevant memories
-    context_parts = []
-
-    # Project-specific memories
-    project_memories = fts5_search(conn, project, project=project, limit=10)
-    if not project_memories:
-        project_memories = fts5_search(conn, "", project=project, limit=10)
-
-    # Open loops
-    open_loops = fts5_search(conn, "", memory_type="open_loop", limit=5)
-
-    # High-importance memories
-    high_importance = conn.execute(
-        """SELECT * FROM memories
-           WHERE superseded_by IS NULL AND importance >= 4
-           ORDER BY updated_at DESC LIMIT 10""",
-    ).fetchall()
-
-    if project_memories:
-        context_parts.append("## Relevant memories for this project:")
-        for r in project_memories:
-            m = r.memory
-            context_parts.append(f"- [{m.memory_type.value}] {m.content}")
-
-    if open_loops:
-        context_parts.append("\n## Open loops (unresolved from previous sessions):")
-        for r in open_loops:
-            m = r.memory
-            context_parts.append(f"- {m.content}")
-
-    if high_importance:
-        from central_brain.db import _row_to_memory
-        context_parts.append("\n## Important memories:")
-        seen_ids = {r.memory.id for r in project_memories} | {r.memory.id for r in open_loops}
-        for row in high_importance:
-            mem = _row_to_memory(row)
-            if mem.id not in seen_ids:
-                context_parts.append(f"- [{mem.memory_type.value}] {mem.content}")
-
+    # Get lightweight summary for the trigger instruction
+    summary = get_session_start_summary(conn, project=project)
     conn.close()
 
-    if context_parts:
-        additional_context = "\n".join(context_parts)
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": f"# Central Brain — Session Memory\n\n{additional_context}",
-            }
-        }
-    else:
-        output = {}
+    if summary["total_memories"] == 0:
+        print(json.dumps({}))
+        return
 
+    # Build preview strings
+    def _preview_line(items: list[str]) -> str:
+        return ", ".join(items) if items else "none"
+
+    top_preview = _preview_line(summary["top_accessed_previews"])
+    loop_preview = _preview_line(summary["open_loop_previews"])
+
+    # Minimal trigger instruction — no memories loaded into context
+    additional_context = (
+        "# Central Brain\n"
+        f"Project: {project} — {summary['total_memories']} memories available. "
+        "User can type \"jarvis\" to activate memory recall.\n\n"
+        "RULES:\n"
+        "- If the user's message is or contains \"jarvis\", present this menu EXACTLY:\n\n"
+        f"  **Brain** ({project}) — {summary['total_memories']} memories\n\n"
+        f"  1. **Most used** ({summary['project_memory_count']}) — {top_preview}\n"
+        f"  2. **Open loops** ({summary['open_loop_count']}) — {loop_preview}\n"
+        f"  3. **Search** — search memories by keyword\n\n"
+        "  Then wait for their pick.\n\n"
+        f"- Handle picks: 1 → call `recall_frequent` tier=\"top\" project=\"{project}\" | "
+        f"2 → call `recall` memory_type=\"open_loop\" project=\"{project}\" | "
+        f"3 → ask keyword, then call `recall` with project=\"{project}\"\n"
+        "- IMPORTANT: Always pass project=\"" + project + "\" to every recall/recall_frequent call.\n"
+        "- If the user does NOT say \"jarvis\", behave completely normally. "
+        "Do not mention memories, do not show this menu, do not load any context."
+    )
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        }
+    }
     print(json.dumps(output))
 
 
