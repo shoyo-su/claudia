@@ -20,6 +20,54 @@ from central_brain.models import Memory, MemorySource, MemoryType
 MAX_TRANSCRIPT_CHARS = 80_000
 
 
+def merge_or_separate(existing_content: str, new_content: str, timeout: int = 30) -> dict | None:
+    """Ask LLM whether two memories should merge or stay separate.
+
+    Returns:
+        {"action": "merge", "content": "...merged text..."} — if they overlap
+        {"action": "separate"} — if they are distinct
+        None — on any failure (caller should fall back to deterministic merge)
+    """
+    prompt = (
+        "You are a memory deduplication assistant. Given two memory entries, decide whether they "
+        "describe the same thing (with overlapping or complementary info) or are distinct memories "
+        "that should coexist.\n\n"
+        "Respond with ONLY valid JSON, no markdown:\n"
+        '- {"action": "merge", "content": "...merged text preserving all unique details from both..."}\n'
+        '- {"action": "separate"}\n\n'
+        f"EXISTING MEMORY:\n{existing_content}\n\n"
+        f"NEW MEMORY:\n{new_content}"
+    )
+
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env["CENTRAL_BRAIN_STOP_HOOK_ACTIVE"] = "1"
+        result = subprocess.run(
+            ["claude", "--print", "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode != 0:
+            print(f"[central-brain] merge_or_separate LLM call failed: {result.stderr}", file=sys.stderr)
+            return None
+
+        text = result.stdout.strip()
+        # Extract JSON from response
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        parsed = json.loads(text[start : end + 1])
+        if parsed.get("action") in ("merge", "separate"):
+            return parsed
+        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        print(f"[central-brain] merge_or_separate failed: {e}", file=sys.stderr)
+        return None
+
+
 def parse_transcript(transcript_path: str) -> list[dict]:
     """Parse a Claude Code JSONL transcript, extracting user + assistant messages."""
     messages = []

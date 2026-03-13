@@ -1,39 +1,49 @@
 # Hooks & Extraction
 
-How Central Brain uses Claude Code hooks for automatic memory accumulation.
+This document covers how Central Brain automatically accumulates memories from your Claude Code sessions without any manual effort.
 
 ---
 
-## Overview
+## Why Automatic Extraction?
 
-Claude Code supports lifecycle hooks — shell commands that run at specific points during a session. Central Brain uses three hooks to automatically:
+The most useful memories are ones you don't have to think about saving. When you spend an hour debugging a SQLAlchemy migration, the important takeaway — "the migration failed because of a missing `nullable=False` column in the ORM model that didn't match the existing schema" — is buried in a long conversation. You're unlikely to stop and manually tag it.
 
-1. **Inject relevant memories** at session start
-2. **Extract memories** before context compaction
-3. **Extract memories** when a session ends
-
-This creates a self-reinforcing memory loop: each session both consumes and produces memories, building up context over time without manual intervention.
+Central Brain hooks into Claude Code's lifecycle to extract these insights automatically. Every session produces memories. Every new session starts with the relevant ones pre-loaded.
 
 ---
 
-## Hook Configuration
+## The Three Hooks
 
-The installer (`install.sh`) configures all hooks automatically. To set them up manually:
+Central Brain uses three Claude Code lifecycle hooks. The installer (`install.sh`) configures all three automatically. Here's what each one does and why it exists.
 
-MCP server config — add to `~/.claude/.mcp.json`:
+### SessionStart — Inject context
 
-```json
-{
-  "mcpServers": {
-    "central-brain": {
-      "command": "central-brain",
-      "args": ["serve"]
-    }
-  }
-}
+**When:** Before every session starts
+**What it does:** Searches the memory database and injects relevant memories into Claude's system prompt
+
+This is what makes the memory *useful*. Without injection, memories would accumulate but never be seen. The hook searches for:
+
+- **Project-specific memories** (up to 10) — Filtered to the current working directory name. If you're in `~/projects/my-api`, it searches for memories tagged with project "my-api".
+- **Open loops** (up to 5) — Any `open_loop` type memory, regardless of project. These are unfinished tasks or questions that should carry forward.
+- **High-importance memories** (up to 10) — Anything scored importance >= 4, regardless of project. Critical errors and preferences should follow you everywhere.
+
+The output is a markdown block that Claude sees as system context:
+
+```
+# Central Brain — Session Memory
+
+## Relevant memories for this project:
+- [error] sqlite-vec requires conn.enable_load_extension(True) before loading
+- [pattern] All API endpoints use the service-repository pattern
+
+## Open loops (unresolved from previous sessions):
+- Phase 3 planning started but not yet implemented
+
+## Important memories:
+- [preference] Never mock the database in integration tests
 ```
 
-Hooks — add to `~/.claude/settings.json`:
+**Configuration:**
 
 ```json
 {
@@ -43,13 +53,54 @@ Hooks — add to `~/.claude/settings.json`:
         "matcher": "",
         "hooks": [{ "type": "command", "command": "central-brain hook-session-start" }]
       }
-    ],
+    ]
+  }
+}
+```
+
+The empty `matcher` means it runs for all projects. The hook reads JSON from stdin (session_id, cwd, transcript_path) and writes JSON to stdout with `additionalContext`.
+
+### PreCompact — Extract before context loss
+
+**When:** Before Claude Code compacts the conversation context
+**What it does:** Runs the full extraction pipeline inline
+
+Context compaction happens when the conversation gets long. Claude Code summarizes older messages to make room. This is the last chance to extract memories from the full conversation before parts of it are lost.
+
+This hook runs **synchronously** (30-120 seconds) because the session is still active and needs the extraction to complete before compaction proceeds.
+
+**Configuration:**
+
+```json
+{
+  "hooks": {
     "PreCompact": [
       {
         "matcher": "",
         "hooks": [{ "type": "command", "command": "central-brain hook-pre-compact" }]
       }
-    ],
+    ]
+  }
+}
+```
+
+### SessionEnd — Extract when you're done
+
+**When:** When the Claude Code session ends
+**What it does:** Spawns a background process to extract memories from the full transcript
+
+This is the primary extraction point. By the time a session ends, the transcript contains everything worth remembering. But the extraction takes 30-120 seconds (it calls `claude --print` under the hood), so it can't block session exit.
+
+The hook spawns a **completely detached subprocess** (`start_new_session=True`) that survives after Claude Code exits. The subprocess:
+- Runs `central-brain extract-async --session-id ... --project ... --transcript ...`
+- Logs to `~/.central-brain/extract.log`
+- Has no stdin/stdout connection to the parent process
+
+**Configuration:**
+
+```json
+{
+  "hooks": {
     "SessionEnd": [
       {
         "matcher": "",
@@ -60,186 +111,38 @@ Hooks — add to `~/.claude/settings.json`:
 }
 ```
 
-Each hook entry uses the `matcher`/`hooks` structure. An empty `matcher` means the hook runs for all projects. The installer deduplicates entries on re-run.
-
 ---
 
-## SessionStart Hook
+## The Extraction Pipeline
 
-**Command:** `central-brain hook-session-start`
-**Behavior:** Blocking (runs before session begins)
+Both PreCompact and SessionEnd hooks run the same extraction pipeline. Here's what happens step by step:
 
-### Input (stdin)
+### 1. Parse the transcript
 
-Claude Code sends JSON:
+Claude Code writes session transcripts as JSONL files. Each line is a message with a role (user/assistant) and content. The parser extracts text from these, skipping tool results (they're large and noisy).
 
-```json
-{
-  "session_id": "abc-123-def",
-  "cwd": "/Users/you/your-project",
-  "transcript_path": "/Users/you/.claude/sessions/abc-123.jsonl"
-}
-```
+### 2. Code intelligence
 
-### What It Does
+Before sending the transcript to the LLM, Central Brain scans it for Python code. It looks for:
 
-1. Records the session in the `sessions` table
-2. Derives `project` from the working directory name (`Path(cwd).name`)
-3. Searches for relevant memories:
-   - **Project-specific memories** — FTS5 search filtered to the current project (up to 10)
-   - **Open loops** — All `open_loop` type memories (up to 5)
-   - **High-importance memories** — All memories with `importance >= 4` (up to 10, deduped against above)
-4. Outputs `additionalContext` that gets injected into the system prompt
+- Fenced code blocks tagged as Python (`` ```python `` or `` ```py ``)
+- Untagged fenced blocks that look like Python (contain `def `, `class `, `import `, or `from X import`)
 
-### Output (stdout)
+Each detected block is parsed with [tree-sitter](https://tree-sitter.github.io/) to extract:
+- **Functions** — name, parameters, decorators
+- **Classes** — name, base classes, method list
+- **Imports** — module name, imported symbols
 
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "SessionStart",
-    "additionalContext": "# Central Brain — Session Memory\n\n## Relevant memories for this project:\n- [pattern] ..."
-  }
-}
-```
-
-If no relevant memories are found, outputs `{}`.
-
----
-
-## PreCompact Hook
-
-**Command:** `central-brain hook-pre-compact`
-**Behavior:** Blocking (runs inline before compaction)
-
-Triggered when Claude Code is about to compact the conversation context. This is a good extraction point because the full transcript is available and may be trimmed during compaction.
-
-### What It Does
-
-Runs the full extraction pipeline **inline** (blocking):
-
-1. Parses the transcript JSONL file
-2. Extracts code intelligence via tree-sitter
-3. Sends transcript to LLM write gate (`claude --print`)
-4. Stores extracted memories with auto-dedup and embedding
-
-Since the session is still active, the extraction runs synchronously. Expect this to take 30-120 seconds depending on transcript length.
-
----
-
-## SessionEnd Hook
-
-**Command:** `central-brain hook-stop`
-**Event:** `SessionEnd`
-**Behavior:** Non-blocking (forks to background)
-
-Triggered when the Claude Code session ends.
-
-### What It Does
-
-1. Checks re-entrancy guards (see below)
-2. Spawns a **detached background subprocess** via `central-brain extract-async`
-3. Returns immediately so the session can exit cleanly
-
-The background subprocess:
-- Runs the full extraction pipeline
-- Sets `ended_at` on the session record
-- Updates `memory_count`
-- Logs output to `~/.central-brain/extract.log`
-
-### Re-entrancy Guard
-
-The extraction pipeline calls `claude --print`, which is itself a Claude Code invocation. Without guards, this would trigger another stop hook, creating infinite recursion.
-
-Two layers of protection:
-
-1. **Environment variable:** `CENTRAL_BRAIN_STOP_HOOK_ACTIVE` is set in the current process before calling `_extract_from_hook`. The extraction subprocess also sets this in the `claude --print` child's environment.
-
-2. **Hook input field:** Claude Code sends `stop_hook_active: true` in the hook's stdin JSON when the hook invocation itself triggered the stop. The hook checks this and exits early.
-
----
-
-## LLM Write Gate
-
-The core extraction mechanism uses `claude --print` (Claude Code's non-interactive mode) to analyze transcripts and produce structured memories.
-
-### How It Works
-
-```
-Transcript text (last 80K chars)
-     +
-Code summary (tree-sitter symbols)
-     |
-     v
-[claude --print -p <extraction_prompt>]
-     |
-     v
-JSON array of memories
-     |
-     v
-Filter: importance >= 3
-     |
-     v
-Store with auto-dedup + auto-embed
-```
-
-### Extraction Prompt
-
-The prompt instructs the LLM to:
-
-- Extract memories as JSON objects with `content`, `memory_type`, `tags`, `importance`
-- Focus on decisions (and why), errors (and root causes), preferences, patterns, open loops, TODOs
-- Exclude routine operations, info already in code/git, temporary debugging context
-- Only include memories scoring importance >= 3
-- Include relevant function/class names when code structure is detected
-
-### Importance Scoring
-
-| Score | Meaning | Example |
-|-------|---------|---------|
-| 5 | Critical — MUST inform future sessions | "Never run migrations without backup — lost prod data on 2026-03-01" |
-| 4 | Important — changes behavior | "User prefers snake_case for all Python" |
-| 3 | Useful context | "The auth middleware uses Redis for session storage" |
-| 2 | Minor detail (excluded) | "Renamed a variable" |
-| 1 | Trivial (excluded) | "Read a file" |
-
-### Environment
-
-The `claude --print` subprocess runs with:
-- `CLAUDECODE` unset — prevents nested session detection
-- `CENTRAL_BRAIN_STOP_HOOK_ACTIVE=1` — prevents child hooks from re-extracting
-- `timeout=120` seconds
-
----
-
-## Code Intelligence
-
-When transcripts contain Python code blocks, tree-sitter is used to extract structured symbols before sending to the LLM.
-
-### Detection
-
-Code blocks are found via:
-1. Fenced blocks tagged as Python (`` ```python `` or `` ```py ``)
-2. Untagged fenced blocks matching Python heuristics (`def `, `class `, `import `, `from X import`)
-
-### Extraction
-
-For each detected block, tree-sitter parses:
-- **Functions** — name, parameters, decorators, line range
-- **Classes** — name, base classes, method names
-- **Imports** — module, imported names
-
-### Output
-
-The symbol summary is injected into the extraction prompt:
+This produces a summary that gets injected into the extraction prompt:
 
 ```
 Code structure found in transcript:
 - Function: extract_memories_via_llm(messages, session_id, project)
 - Class: VoyageEmbedder (methods: embed, embed_single)
-- Imports: voyageai, numpy
+- Imports: voyageai, numpy, sqlite_vec
 ```
 
-Structured metadata is stored in `Memory.metadata.code_intel`:
+And structured metadata that gets stored on each extracted memory:
 
 ```json
 {
@@ -252,58 +155,86 @@ Structured metadata is stored in `Memory.metadata.code_intel`:
 }
 ```
 
+If tree-sitter isn't installed, this step is skipped silently.
+
+### 3. LLM write gate
+
+The transcript (last 80,000 characters) and code summary are sent to `claude --print` — Claude Code's non-interactive mode. The extraction prompt asks the LLM to:
+
+- Produce a JSON array of memories, each with `content`, `memory_type`, `tags`, and `importance`
+- Focus on decisions (and *why*), errors (and root causes), preferences, patterns, open loops, TODOs
+- Reference specific function/class names when code structure is available
+- Exclude routine operations, info already in code/git, temporary debugging context
+- Only include items scoring importance >= 3
+
+### 4. Filter and store
+
+The LLM response is parsed as JSON. Each item with importance < 3 is discarded. Surviving memories are inserted with full deduplication and auto-embedding. The session record is updated with `ended_at` and `memory_count`.
+
+### Re-entrancy protection
+
+There's a subtle problem: the extraction pipeline calls `claude --print`, which is itself a Claude Code invocation. That invocation could trigger a SessionEnd hook, which would run another extraction, which would call `claude --print` again... infinite recursion.
+
+Two guards prevent this:
+
+1. **Environment variable** — The extraction process sets `CENTRAL_BRAIN_STOP_HOOK_ACTIVE=1` before calling `claude --print`. The SessionEnd hook checks this and exits immediately.
+
+2. **Hook input** — Claude Code passes `stop_hook_active: true` in the hook's stdin JSON when the stop hook itself triggered the invocation. The hook checks this as a cross-process guard.
+
 ---
 
 ## Troubleshooting
 
-### `claude` CLI not found
+### Extraction isn't producing any memories
 
-The extraction pipeline requires the `claude` CLI to be on `PATH`. If you installed Claude Code via npm, ensure the npm bin directory is in your shell's `PATH`.
+Check the extraction log:
+```bash
+cat ~/.central-brain/extract.log
+```
+
+Common causes:
+- **No transcript path** — Older Claude Code versions may not pass `transcript_path` in hook input
+- **Empty transcript** — Very short sessions may not have enough content to extract from
+- **LLM returned `[]`** — The session genuinely had nothing worth remembering
+
+### `claude` CLI not found
 
 ```
 [central-brain] claude CLI not found, skipping LLM extraction
 ```
 
-### No transcript path
-
-The hook received input without a `transcript_path` field. This can happen with older Claude Code versions.
-
-```
-[central-brain] No transcript path in stop hook input
-```
+The extraction pipeline requires the `claude` CLI on `PATH`. If you installed Claude Code via npm, ensure the npm bin directory is in your `PATH`.
 
 ### Extraction timeout
-
-The LLM write gate has a 120-second timeout. Very long transcripts (near the 80K char limit) may take longer. If this happens frequently, the extraction still completes for the PreCompact hook (which runs earlier with a shorter transcript).
 
 ```
 [central-brain] LLM extraction timed out
 ```
 
-### Ghost sessions (ended_at = NULL)
+The LLM write gate has a 120-second timeout. Very long transcripts may need more time. The PreCompact hook (which runs earlier with a shorter transcript) usually succeeds even when SessionEnd times out.
 
-Background extraction spawns a `claude --print` subprocess that triggers the SessionStart hook, creating session records with `ended_at = NULL`. These are harmless but visible in `list_recent_sessions`. They're an artifact of the re-entrancy pattern.
+### Ghost sessions
 
-### Missing VOYAGE_API_KEY
+`list_recent_sessions` shows sessions with `ended_at = null`. These are created when background extraction spawns a `claude --print` subprocess, which triggers a SessionStart hook. They're harmless artifacts of the re-entrancy pattern.
 
-If `VOYAGE_API_KEY` is set in `~/.zshrc` but not exported, subprocesses (hooks, background extraction) can't see it. Make sure to use:
+### VOYAGE_API_KEY not visible to hooks
 
-```bash
-export VOYAGE_API_KEY="your-key-here"
-```
-
-Not just:
+If `VOYAGE_API_KEY` is in your `~/.zshrc` but hooks can't see it:
 
 ```bash
-VOYAGE_API_KEY="your-key-here"  # Missing export — won't work in hooks
+# Wrong — not exported, subprocesses can't see it
+VOYAGE_API_KEY="your-key"
+
+# Right — exported to subprocess environment
+export VOYAGE_API_KEY="your-key"
 ```
 
-### Checking extraction logs
+### Checking what was injected at session start
 
-Background extraction output goes to:
+The SessionStart hook's output is visible in Claude Code's system context. You can also test it manually:
 
 ```bash
-cat ~/.central-brain/extract.log
+echo '{"session_id": "test", "cwd": "'$(pwd)'"}' | central-brain hook-session-start
 ```
 
-This includes both stdout and stderr from the `central-brain extract-async` process.
+This shows exactly what would be injected for the current directory.

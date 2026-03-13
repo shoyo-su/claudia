@@ -75,7 +75,7 @@ def remember(
         tags=tags or [],
         importance=importance,
     )
-    result = insert_memory(conn, mem, embedder=embedder)
+    result = insert_memory(conn, mem, embedder=embedder, llm_merge=False)
     return {
         "status": "stored",
         "id": result.id,

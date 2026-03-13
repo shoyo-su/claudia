@@ -196,9 +196,9 @@ def hook_session_start():
     additional_context = (
         "# Central Brain\n"
         f"Project: {project} — {summary['total_memories']} memories available. "
-        "User can type \"jarvis\" to activate memory recall.\n\n"
+        "User can type \"claudia\" to activate memory recall.\n\n"
         "RULES:\n"
-        "- If the user's message is or contains \"jarvis\", present this menu EXACTLY:\n\n"
+        "- If the user's message is or contains \"claudia\", present this menu EXACTLY:\n\n"
         f"  **Brain** ({project}) — {summary['total_memories']} memories\n\n"
         f"  1. **Most used** ({summary['project_memory_count']}) — {top_preview}\n"
         f"  2. **Open loops** ({summary['open_loop_count']}) — {loop_preview}\n"
@@ -208,7 +208,7 @@ def hook_session_start():
         f"2 → call `recall` memory_type=\"open_loop\" project=\"{project}\" | "
         f"3 → ask keyword, then call `recall` with project=\"{project}\"\n"
         "- IMPORTANT: Always pass project=\"" + project + "\" to every recall/recall_frequent call.\n"
-        "- If the user does NOT say \"jarvis\", behave completely normally. "
+        "- If the user does NOT say \"claudia\", behave completely normally. "
         "Do not mention memories, do not show this menu, do not load any context."
     )
 

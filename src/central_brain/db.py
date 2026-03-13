@@ -203,21 +203,104 @@ def embed_and_store(conn: sqlite3.Connection, memory_id: int, content: str, embe
         logger.debug("Failed to embed memory %d: %s", memory_id, e)
 
 
+# --- Enrichment helpers ---
+
+def _merge_metadata(existing: dict, new: dict) -> dict:
+    """Deep-merge metadata dicts. For code_intel, union inner lists. Otherwise new overrides."""
+    merged = {**existing}
+    for key, value in new.items():
+        if key == "code_intel" and key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            ci = {**merged[key]}
+            for ci_key, ci_val in value.items():
+                if isinstance(ci_val, list) and isinstance(ci.get(ci_key), list):
+                    # Union the lists, preserving order and deduplicating
+                    seen = set()
+                    union = []
+                    for item in ci[ci_key] + ci_val:
+                        item_key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else item
+                        if item_key not in seen:
+                            seen.add(item_key)
+                            union.append(item)
+                    ci[ci_key] = union
+                else:
+                    ci[ci_key] = ci_val
+            merged[key] = ci
+        else:
+            merged[key] = value
+    return merged
+
+
+def _enrich_memory(
+    conn: sqlite3.Connection,
+    existing: Memory,
+    new_memory: Memory,
+    embedder=None,
+    llm_merge: bool = True,
+) -> Memory | None:
+    """Enrich an existing memory with data from a new near-duplicate.
+
+    Returns the enriched Memory, or None if the LLM says "separate"
+    (meaning the caller should insert new_memory as a fresh row).
+    """
+    # 1. Tags: union
+    merged_tags = list(set(existing.tags) | set(new_memory.tags))
+
+    # 2. Importance: max
+    merged_importance = max(existing.importance, new_memory.importance)
+
+    # 3. Metadata: deep merge
+    merged_metadata = _merge_metadata(existing.metadata or {}, new_memory.metadata or {})
+
+    # 4. Content: LLM-gated
+    merged_content = None
+    enrichment_count = merged_metadata.get("enrichment_count", 0)
+    content_too_large = len(existing.content) > 1000
+    enrichment_capped = enrichment_count >= 5
+
+    if llm_merge and not content_too_large and not enrichment_capped:
+        from central_brain.extract import merge_or_separate
+
+        result = merge_or_separate(existing.content, new_memory.content)
+        if result is not None:
+            if result["action"] == "separate":
+                return None  # Signal caller to insert as new memory
+            if result["action"] == "merge":
+                merged_content = result.get("content")
+                if merged_content:
+                    merged_metadata["enrichment_count"] = enrichment_count + 1
+
+    # 5. Apply all via update_memory (handles FTS5 triggers + re-embedding)
+    updated = update_memory(
+        conn,
+        existing.id,
+        content=merged_content,
+        tags=merged_tags,
+        importance=merged_importance,
+        metadata=merged_metadata,
+        embedder=embedder,
+    )
+
+    # 6. Bump access_count
+    conn.execute(
+        "UPDATE memories SET access_count = access_count + 1 WHERE id = ?",
+        (existing.id,),
+    )
+    conn.commit()
+
+    return updated or existing
+
+
 # --- Memory CRUD ---
 
-def insert_memory(conn: sqlite3.Connection, memory: Memory, dedup: bool = True, embedder=None) -> Memory | None:
+def insert_memory(conn: sqlite3.Connection, memory: Memory, dedup: bool = True, embedder=None, llm_merge: bool = True) -> Memory | None:
     # Dedup: check if a similar memory already exists (same type, high content overlap)
     if dedup:
         existing = _find_duplicate(conn, memory, embedder=embedder)
         if existing:
-            # Update importance if new one is higher, bump access count
-            if memory.importance > existing.importance:
-                conn.execute(
-                    "UPDATE memories SET importance = ?, access_count = access_count + 1, updated_at = ? WHERE id = ?",
-                    (memory.importance, _now(), existing.id),
-                )
-                conn.commit()
-            return existing
+            result = _enrich_memory(conn, existing, memory, embedder=embedder, llm_merge=llm_merge)
+            if result is not None:
+                return result
+            # LLM said "separate" — fall through to insert as new memory
 
     now = _now()
     cur = conn.execute(
