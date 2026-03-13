@@ -2,122 +2,111 @@
 
 ## Getting Started
 
-The quickest way to get set up:
-
 ```bash
 git clone <repo-url>
 cd central-brain
 ./install.sh
 ```
 
-The installer handles Python version detection, `uv` installation, MCP/hook configuration, and optional VoyageAI setup.
+The installer handles Python version detection, `uv` installation, MCP/hook configuration, and optional VoyageAI setup. It's idempotent — safe to re-run.
 
-For development, you can also install manually:
+For manual setup or if you just want to run the code without configuring hooks:
 
 ```bash
 cd central-brain
 uv sync
+uv run central-brain search "test"  # Verify it works
 ```
 
-Verify the install:
-
-```bash
-uv run central-brain serve   # Should start MCP server (ctrl-c to exit)
-uv run central-brain search "test"  # Should run without errors
-```
-
-## Development Setup
-
-Central Brain uses [uv](https://docs.astral.sh/uv/) as its package manager. For development, install in editable mode:
+For development, install in editable mode so code changes are reflected immediately:
 
 ```bash
 uv tool install -e .
 ```
 
-This makes the `central-brain` command available globally and reflects code changes immediately.
-
 ## Project Structure
 
 ```
 src/central_brain/
-├── cli.py          # CLI entrypoint, subcommands, hook handlers
-├── server.py       # FastMCP server with 7 MCP tool definitions
-├── db.py           # SQLite + FTS5 + sqlite-vec, CRUD, dedup, migrations
-├── search.py       # Hybrid search with RRF fusion
-├── extract.py      # Transcript parsing, LLM write gate
-├── embedder.py     # VoyageAI embedding wrapper
-├── models.py       # Pydantic models (Memory, Session, MemoryType)
-└── code_intel.py   # Tree-sitter Python parsing
+├── cli.py        # Entry point — dispatches subcommands and hook handlers
+├── server.py     # FastMCP server — defines the 7 MCP tools Claude sees
+├── db.py         # All SQLite: CRUD, dedup, FTS5, sqlite-vec, migrations
+├── search.py     # Hybrid search: FTS5 BM25 + vector similarity + RRF fusion
+├── extract.py    # Reads transcripts, calls LLM write gate, stores memories
+├── embedder.py   # VoyageAI wrapper — returns None when unavailable
+├── models.py     # Pydantic data models (Memory, Session, MemoryType)
+└── code_intel.py # Tree-sitter Python parser — extracts symbols from code blocks
 ```
+
+The key pattern to understand: `cli.py` is the single entry point for everything. It either starts the MCP server (loading `server.py`) or handles hooks/CLI commands directly. Both paths use `db.py` for storage and `search.py` for retrieval. Optional capabilities (VoyageAI, sqlite-vec, tree-sitter) are always accessed through factory functions that return `None` when unavailable.
 
 ## Code Style
 
-- **Type hints everywhere** — use `from __future__ import annotations` at the top of every module
-- **Pydantic v2** for data models
-- **Logging** — use `logger = logging.getLogger(__name__)` per module, not print statements (except in CLI output)
-- **Graceful degradation** — features that depend on optional services (VoyageAI, sqlite-vec, tree-sitter) must fail silently and fall back
+- **Type hints** — Every module starts with `from __future__ import annotations`. All functions have type annotations.
+- **Pydantic v2** — Data models use Pydantic with `Field()` for defaults and validation.
+- **Logging** — `logger = logging.getLogger(__name__)` per module. Use logging for internal diagnostics, `print(..., file=sys.stderr)` only for user-visible CLI output.
+- **Graceful degradation** — Any feature depending on an optional service (VoyageAI, sqlite-vec, tree-sitter) must wrap the import in try/except and expose a boolean flag or factory. Never let an optional dependency cause an import error.
 
-## Adding a New Memory Type
+## Common Tasks
 
-1. Add the new value to `MemoryType` enum in `models.py`
-2. Update the extraction prompt in `extract.py` (`_build_extraction_prompt`) to describe when the LLM should use this type
+### Adding a New Memory Type
+
+1. Add the value to `MemoryType` enum in `models.py`
+2. Update `_build_extraction_prompt()` in `extract.py` — describe when the LLM should classify memories as this type
 3. Update the `memory_type` parameter descriptions in `server.py` tool docstrings
-4. Update the Memory Types table in `README.md`
+4. Add a row to the Memory Types table in `README.md`
 
-## Adding a New MCP Tool
+### Adding a New MCP Tool
 
-1. Define the tool function with `@mcp.tool()` decorator in `server.py`
-2. Use the lazy-init pattern: call `_get_conn()` and `_get_embedder()` instead of accessing globals directly
-3. Add any new DB operations to `db.py`
-4. Document the tool in `docs/mcp-tools-reference.md`
-5. Add a row to the MCP Tools summary table in `README.md`
+1. Add a function with `@mcp.tool()` decorator in `server.py`
+2. Use `_get_conn()` and `_get_embedder()` for lazy-init access to the database and embedder
+3. Add any new database operations to `db.py`
+4. Document the tool in `docs/mcp-tools-reference.md` and add it to the summary in `README.md`
 
-## Database Migrations
+### Adding a Database Migration
 
-The schema version is tracked in the `schema_version` table (current: **v2**).
-
-To add a migration:
+Schema version is tracked in the `schema_version` table (current: **v2**).
 
 1. Increment `SCHEMA_VERSION` in `db.py`
-2. Add a `_migrate_to_vN(conn)` function with the migration logic
-3. Add the version check in `init_db()`:
+2. Add a `_migrate_to_vN(conn)` function
+3. Add the migration check in `init_db()`:
    ```python
    if current_version < N:
        _migrate_to_vN(conn)
    ```
-4. Handle the case where optional extensions (sqlite-vec) may not be available — use `_ensure_*` helper patterns
+4. If the migration depends on an optional extension (like sqlite-vec), use the `_ensure_*` pattern — a helper that silently skips creation if the extension isn't loaded, and gets called on every `init_db()` so it picks up the extension if installed later.
 
 ## Testing
 
-Central Brain does not have an automated test suite yet. This is a great contribution opportunity.
+There's no automated test suite yet — **this is a great contribution opportunity**.
 
-Current manual testing workflow:
+Manual testing workflow:
 
 ```bash
-# Test MCP server
+# MCP server starts without errors
 central-brain serve
 
-# Test search
-central-brain search "some query"
-central-brain search "query" --project my-project --type pattern
+# Search works (expect 0 results on fresh install)
+central-brain search "test"
+central-brain search "query" --project my-project --type error
 
-# Test embedding backfill
+# Embedding backfill runs (requires VOYAGE_API_KEY)
 central-brain backfill-embeddings
 
-# Test hook handlers (pipe JSON to stdin)
-echo '{"session_id": "test", "cwd": "/tmp"}' | central-brain hook-session-start
+# Hook handlers process stdin correctly
+echo '{"session_id": "test-123", "cwd": "/tmp/my-project"}' | central-brain hook-session-start
 ```
 
-If you'd like to add tests, consider:
-- Unit tests for `db.py` (CRUD, dedup logic, migrations)
-- Unit tests for `search.py` (FTS5 query building, RRF fusion)
-- Unit tests for `extract.py` (transcript parsing, LLM response parsing)
-- Unit tests for `code_intel.py` (Python block detection, tree-sitter parsing)
-- Integration tests with a temporary SQLite database
+Good test targets if you want to add a suite:
+- `db.py` — CRUD operations, dedup logic (all three tiers), migration paths
+- `search.py` — FTS5 query building, RRF fusion math, empty-query fallback
+- `extract.py` — Transcript JSONL parsing, LLM response JSON parsing, importance filtering
+- `code_intel.py` — Python block detection (tagged and heuristic), tree-sitter symbol extraction
+- Integration tests with a temp SQLite database (no VoyageAI needed for FTS5-only tests)
 
 ## PR Guidelines
 
-- Keep PRs focused — one feature or fix per PR
-- Describe **why**, not just what
-- Update documentation for any user-facing changes
-- Test manually with the workflow above before submitting
+- **One thing per PR** — A bug fix, a feature, a refactor. Not all three.
+- **Describe why** — The diff shows *what* changed. The PR description should explain *why*.
+- **Update docs** — If your change affects what users see (new tool, changed behavior, new config), update the relevant docs.
+- **Test manually** — Run through the manual testing workflow above before submitting.

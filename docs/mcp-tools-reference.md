@@ -1,226 +1,193 @@
 # MCP Tools Reference
 
-Full API reference for Central Brain's 7 MCP tools.
+These are the 7 tools available to Claude during a session. Most of the time, memory extraction and injection happen automatically via hooks. These tools are for when Claude (or you) want to explicitly interact with the memory system — saving something important mid-session, searching for past context, or managing existing memories.
 
 ---
 
 ## `remember`
 
-Store a memory in the central brain. Automatically deduplicates against existing memories using FTS5 fuzzy matching, word overlap (>50%), and vector distance (<0.15). If a duplicate is found, the existing memory's importance is bumped if the new one is higher.
+Store a memory. This is what Claude calls when it wants to explicitly save something — a decision, a preference correction, an error root cause.
+
+Automatically deduplicates: if a substantially similar memory already exists (same type, >50% word overlap or vector distance <0.15), the existing memory is returned instead and its importance is bumped if the new one scored higher.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `content` | `str` | Yes | — | The memory content — what should be remembered |
+| `content` | `str` | Yes | — | What should be remembered |
 | `memory_type` | `str` | No | `"insight"` | One of: `insight`, `decision`, `pattern`, `error`, `preference`, `todo`, `open_loop` |
-| `project` | `str \| null` | No | `null` | Project name/path this memory relates to |
+| `project` | `str \| null` | No | `null` | Project this relates to (e.g., "my-api") |
 | `tags` | `list[str] \| null` | No | `null` | Keywords for categorization |
-| `importance` | `int` | No | `3` | 1-5 score (5 = critical) |
-| `session_id` | `str \| null` | No | `null` | Session this memory came from. If provided, source is set to `"session"`; otherwise `"manual"` |
+| `importance` | `int` | No | `3` | 1 (trivial) to 5 (critical) |
+| `session_id` | `str \| null` | No | `null` | Links the memory to a session. Sets source to `"session"` instead of `"manual"`. |
 
-### Response
+### Example Response
 
 ```json
 {
   "status": "stored",
   "id": 42,
-  "content": "User prefers snake_case for Python variables",
-  "memory_type": "preference"
+  "content": "The payment webhook handler needs exponential backoff on 429 responses from Stripe",
+  "memory_type": "error"
 }
 ```
 
-### Notes
-
-- When a duplicate is detected, the existing memory is returned instead of creating a new one.
-- Embeddings are automatically generated and stored if `VOYAGE_API_KEY` is available.
+If a duplicate was found, the existing memory is enriched (tags unioned, importance bumped, metadata merged) and returned — no new row is created. Note: the `remember` tool uses `llm_merge=False`, so it applies deterministic merging (union tags, max importance, merge metadata) but does not call the LLM to merge content. This avoids blocking the tool response on a background LLM call. Auto-extracted memories from hooks use full LLM-powered merging — see [Architecture: Deduplication & Enrichment](architecture.md#deduplication--enrichment) for details.
 
 ---
 
 ## `recall`
 
-Search memories using hybrid FTS5 + vector search with Reciprocal Rank Fusion (RRF). When the query is empty, returns recent memories sorted by importance.
+Search for memories. Uses hybrid FTS5 + vector search with Reciprocal Rank Fusion when VoyageAI is configured, FTS5-only otherwise. With an empty query, returns recent memories sorted by importance.
+
+This is useful when Claude wants to check if something was discussed before, or when you ask "have we dealt with this pattern before?"
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `query` | `str` | No | `""` | Natural language search query. Empty returns recent memories. |
-| `project` | `str \| null` | No | `null` | Filter results to a specific project |
-| `memory_type` | `str \| null` | No | `null` | Filter by type (`insight`, `decision`, `pattern`, `error`, `preference`, `todo`, `open_loop`) |
-| `limit` | `int` | No | `10` | Maximum number of results to return |
+| `query` | `str` | No | `""` | Natural language search. Empty = return recent memories. |
+| `project` | `str \| null` | No | `null` | Filter to a specific project |
+| `memory_type` | `str \| null` | No | `null` | Filter by type |
+| `limit` | `int` | No | `10` | Max results |
 
-### Response
+### Example Response
 
 ```json
 [
   {
     "id": 42,
-    "content": "User prefers snake_case for Python variables",
-    "memory_type": "preference",
-    "project": "my-project",
-    "tags": ["python", "style"],
-    "importance": 4,
+    "content": "The payment webhook handler needs exponential backoff on 429 responses from Stripe",
+    "memory_type": "error",
+    "project": "my-api",
+    "tags": ["stripe", "webhooks", "retry"],
+    "importance": 5,
     "score": 0.0328,
     "created_at": "2026-03-10T14:30:00+00:00"
   }
 ]
 ```
 
-### Notes
-
-- `score` is the RRF fusion score when both FTS5 and vector results are available, or the BM25 score for FTS5-only.
-- Access counts are bumped for all returned memories.
-- With an empty query, results are ordered by `importance DESC, created_at DESC`.
+`score` is the RRF fusion score (or BM25 score for FTS5-only). Higher means more relevant. Every returned memory gets its `access_count` bumped.
 
 ---
 
 ## `forget`
 
-Supersede or permanently delete a memory.
+Remove a memory. Two modes:
+
+- **Supersede** (soft delete) — Pass `superseded_by` to mark the memory as replaced by a newer one. The old memory stays in the database but is excluded from search. Use this when a memory is outdated.
+- **Delete** (hard delete) — Omit `superseded_by` to permanently remove it. Use this when a memory is just wrong.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `memory_id` | `int` | Yes | — | ID of the memory to forget |
-| `superseded_by` | `int \| null` | No | `null` | If provided, marks the memory as superseded by this ID (soft delete). Otherwise, hard deletes. |
+| `memory_id` | `int` | Yes | — | ID of the memory to remove |
+| `superseded_by` | `int \| null` | No | `null` | ID of the replacement memory (soft delete) |
 
-### Response
+### Example Responses
 
-**When superseded:**
 ```json
-{
-  "status": "superseded",
-  "id": 42,
-  "superseded_by": 43
-}
+{"status": "superseded", "id": 42, "superseded_by": 43}
 ```
 
-**When deleted:**
 ```json
-{
-  "status": "deleted",
-  "id": 42
-}
+{"status": "deleted", "id": 42}
 ```
 
-**When not found:**
 ```json
-{
-  "status": "not_found",
-  "id": 999
-}
+{"status": "not_found", "id": 999}
 ```
-
-### Notes
-
-- Superseded memories are excluded from search results but remain in the database.
-- Prefer superseding over deleting when a memory is being replaced by an updated version.
 
 ---
 
 ## `get_memory_by_id`
 
-Fetch a specific memory by its ID. Returns all fields including metadata.
+Fetch a specific memory with all its fields — including metadata (code intelligence data), access count, and superseded status. Useful for inspecting a memory before updating or superseding it.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `memory_id` | `int` | Yes | — | The memory ID to retrieve |
+| `memory_id` | `int` | Yes | — | The memory ID |
 
-### Response
+### Example Response
 
 ```json
 {
   "id": 42,
-  "content": "User prefers snake_case for Python variables",
-  "memory_type": "preference",
-  "source": "manual",
-  "project": "my-project",
-  "tags": ["python", "style"],
-  "importance": 4,
-  "access_count": 7,
+  "content": "The payment webhook handler needs exponential backoff on 429 responses from Stripe",
+  "memory_type": "error",
+  "source": "session",
+  "project": "my-api",
+  "tags": ["stripe", "webhooks", "retry"],
+  "importance": 5,
+  "access_count": 12,
   "created_at": "2026-03-10T14:30:00+00:00",
   "updated_at": "2026-03-12T09:15:00+00:00",
   "superseded_by": null,
-  "metadata": {}
+  "metadata": {
+    "code_intel": {
+      "functions": ["handle_webhook", "process_payment_event"],
+      "classes": [],
+      "imports": ["stripe"],
+      "language": "python"
+    }
+  }
 }
 ```
 
-**When not found:**
-```json
-{
-  "error": "not_found",
-  "id": 999
-}
-```
-
-### Notes
-
-- This call increments the memory's `access_count`.
+This call increments `access_count`.
 
 ---
 
 ## `update_memory_tool`
 
-Update an existing memory's content, tags, or importance. Only the provided fields are updated; others remain unchanged.
+Update a memory's content, tags, or importance. Only the fields you pass are changed — omitted fields stay as they are. If content is updated, the embedding is automatically regenerated.
+
+Useful when Claude refines its understanding — "actually, the issue wasn't just 429s, it was also 503s" — and wants to update the memory rather than creating a new one.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `memory_id` | `int` | Yes | — | The memory ID to update |
+| `memory_id` | `int` | Yes | — | The memory ID |
 | `content` | `str \| null` | No | `null` | New content text |
-| `tags` | `list[str] \| null` | No | `null` | New tags list (replaces existing) |
-| `importance` | `int \| null` | No | `null` | New importance score (1-5) |
+| `tags` | `list[str] \| null` | No | `null` | New tags (replaces existing) |
+| `importance` | `int \| null` | No | `null` | New importance (1-5) |
 
-### Response
+### Example Response
 
 ```json
 {
   "status": "updated",
   "id": 42,
-  "content": "User prefers snake_case for all Python identifiers",
-  "tags": ["python", "style", "naming"],
+  "content": "The payment webhook handler needs exponential backoff on 429 and 503 responses from Stripe",
+  "tags": ["stripe", "webhooks", "retry", "error-handling"],
   "importance": 5
 }
 ```
-
-**When not found:**
-```json
-{
-  "error": "not_found",
-  "id": 999
-}
-```
-
-### Notes
-
-- If `content` is updated, the embedding is automatically regenerated.
-- The `updated_at` timestamp is refreshed on any update.
-- This call also increments `access_count` (via the internal `get_memory` call).
 
 ---
 
 ## `list_recent_sessions`
 
-List recent Claude Code sessions with their summaries and memory counts.
+List recent Claude Code sessions. Shows when each session ran, which project it was in, and how many memories were extracted. Useful for understanding extraction activity or debugging missing memories.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `limit` | `int` | No | `10` | Maximum number of sessions to return |
+| `limit` | `int` | No | `10` | Max sessions |
 
-### Response
+### Example Response
 
 ```json
 [
   {
     "session_id": "abc-123-def",
-    "project": "central-brain",
+    "project": "my-api",
     "started_at": "2026-03-12T10:00:00+00:00",
     "ended_at": "2026-03-12T11:30:00+00:00",
     "summary": null,
@@ -229,22 +196,19 @@ List recent Claude Code sessions with their summaries and memory counts.
 ]
 ```
 
-### Notes
-
-- Sessions are ordered by `started_at DESC`.
-- Sessions with `ended_at = null` may indicate the session is still active or the stop hook didn't fire (e.g., ghost sessions from background extraction subprocesses).
+Sessions with `ended_at = null` are either still active or are ghost sessions created by the background extraction subprocess (harmless).
 
 ---
 
 ## `brain_stats`
 
-Get statistics about the central brain — total memory counts, breakdown by type, most accessed, and recent additions.
+A dashboard view of the memory system. Shows total memory count broken down by type, the most frequently accessed memories, and the most recent additions.
 
 ### Parameters
 
 None.
 
-### Response
+### Example Response
 
 ```json
 {
@@ -262,14 +226,14 @@ None.
   "most_accessed": [
     {
       "id": 12,
-      "content": "Affiliates use a single hardcoded campaign 'affiliate-referral-v1'...",
+      "content": "Never use time.sleep() in async handlers — blocks the event loop...",
       "access_count": 23
     }
   ],
   "recent": [
     {
       "id": 142,
-      "content": "Central Brain Phase 2 is complete...",
+      "content": "Chose Celery over RQ because we need task chaining for payment...",
       "memory_type": "decision",
       "created_at": "2026-03-12T11:30:00+00:00"
     }
@@ -277,8 +241,4 @@ None.
 }
 ```
 
-### Notes
-
-- Only non-superseded memories are counted.
-- `most_accessed` returns up to 5 memories, `recent` returns up to 10.
-- Content in `most_accessed` and `recent` is truncated to 100 characters.
+Only non-superseded memories are counted. `most_accessed` returns up to 5, `recent` up to 10. Content is truncated to 100 characters.

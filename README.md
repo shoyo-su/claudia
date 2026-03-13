@@ -209,15 +209,24 @@ central-brain search "webhook error handling" --project my-api --type error
 
 You see hybrid or FTS5-only mode, depending on whether VoyageAI is configured.
 
-## Deduplication
+## Deduplication & Memory Merging
 
-Sessions often produce similar insights. Central Brain prevents duplicates with a 3-tier check on every insert:
+Sessions often produce similar insights. "Don't use `time.sleep()` in async code" might come up across three different conversations. Without dedup, you'd accumulate near-identical memories.
+
+Central Brain detects duplicates with a 3-tier check on every insert:
 
 1. **FTS5 fuzzy match** — Search for the first 8 words of the new memory, filtered to the same memory type
 2. **Word overlap** — If any candidate shares >50% of words (Jaccard similarity), it's a duplicate
 3. **Vector distance** — If the above didn't catch it, check if any existing memory has vector distance <0.15 (very semantically similar)
 
-When a duplicate is found, the new memory is *not* inserted. Instead, the existing memory's importance is bumped if the new one scored higher. This keeps the memory count clean while still reflecting that a topic keeps coming up.
+When a duplicate is found, the new memory isn't blindly discarded — it goes through an **LLM-powered merge**. Central Brain calls `claude --print` with both the existing and new memory, asking it to decide:
+
+- **Merge** — The two memories overlap or complement each other. The LLM produces a single merged text that preserves all unique details from both. For example, if session 1 learned "webhook handler drops 429 errors" and session 3 learned "webhook handler also drops 503 errors", the merged memory becomes "webhook handler drops 429 and 503 errors — needs exponential backoff for both".
+- **Separate** — The memories are actually distinct despite textual similarity. The new memory is inserted as a separate row.
+
+The merge also unions tags, takes the higher importance, and deep-merges metadata (including `code_intel` lists). An `enrichment_count` in metadata tracks how many times a memory has been merged — once it hits 5 merges or 1000 characters, further LLM merges are skipped to keep memories focused.
+
+When the LLM is unavailable or the merge call fails, it falls back to a deterministic merge: bump importance, union tags, merge metadata, but leave the content unchanged.
 
 ## Graceful Degradation
 

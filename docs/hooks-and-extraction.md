@@ -167,9 +167,15 @@ The transcript (last 80,000 characters) and code summary are sent to `claude --p
 - Exclude routine operations, info already in code/git, temporary debugging context
 - Only include items scoring importance >= 3
 
-### 4. Filter and store
+### 4. Filter, store, and merge
 
-The LLM response is parsed as JSON. Each item with importance < 3 is discarded. Surviving memories are inserted with full deduplication and auto-embedding. The session record is updated with `ended_at` and `memory_count`.
+The LLM response is parsed as JSON. Each item with importance < 3 is discarded.
+
+Surviving memories are inserted with full deduplication, auto-embedding, and **LLM-powered merging**. If a near-duplicate already exists in the database, Central Brain calls `claude --print` again (with a 30-second timeout) to ask whether the new and existing memory should merge or stay separate. If they should merge, the LLM produces a single combined text that preserves unique details from both. This is how memories *accumulate knowledge* across sessions — instead of having three separate memories about the same webhook bug, you get one rich memory that includes everything learned across all three encounters.
+
+The merge has safeguards: memories are capped at 5 enrichments and 1000 characters, and if the LLM call fails, a deterministic merge (union tags, max importance, merge metadata) is applied instead.
+
+The session record is updated with `ended_at` and `memory_count`.
 
 ### Re-entrancy protection
 

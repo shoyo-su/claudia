@@ -138,11 +138,15 @@ Every memory returned by a search gets its `access_count` bumped. This is a deli
 
 ---
 
-## Deduplication
+## Deduplication & Enrichment
 
-Sessions often produce similar memories. "Don't use time.sleep() in async code" might come up in three different conversations. Without dedup, you'd accumulate near-identical memories that waste space and confuse search results.
+Sessions often produce similar memories. Without dedup, you'd accumulate near-identical entries. But simple dedup (discard the new one) loses information — the new memory might add details the original didn't have.
 
-Every `insert_memory` call runs a 3-tier dedup check:
+Central Brain solves this with a two-phase approach: **detect** duplicates, then **enrich** the existing memory with information from the new one.
+
+### Phase 1: Duplicate Detection
+
+Every `insert_memory` call runs a 3-tier check:
 
 **Tier 1 — FTS5 candidate generation.** Take the first 8 words of the new memory, search for them in the FTS5 index, filtered to the same `memory_type` and not superseded. This is cheap and narrows the search space to at most 5 candidates.
 
@@ -150,7 +154,29 @@ Every `insert_memory` call runs a 3-tier dedup check:
 
 **Tier 3 — Vector distance.** If word overlap didn't catch it and an embedder is available, embed the new memory and check the 3 nearest vectors. If any has distance < 0.15, it's a semantic duplicate — same meaning, completely different words.
 
-When a duplicate is found, the existing memory's importance is bumped (if the new one scored higher) and its access count is incremented. The new memory is *not* inserted. This keeps the database lean while still reflecting that the topic keeps coming up.
+### Phase 2: LLM-Powered Enrichment
+
+When a duplicate is found, `_enrich_memory()` merges the two memories intelligently instead of just discarding the new one:
+
+1. **Tags** — Union of both tag sets
+2. **Importance** — Max of both scores
+3. **Metadata** — Deep merge via `_merge_metadata()`. For `code_intel`, inner lists (functions, classes, imports) are unioned with deduplication. Other keys use new-overrides-old.
+4. **Content** — The core of the enrichment. Calls `merge_or_separate()` in `extract.py`, which sends both memories to `claude --print`:
+
+The LLM is asked: "Do these describe the same thing, or are they distinct?" It responds with:
+- `{"action": "merge", "content": "...merged text..."}` — The two overlap. The merged text preserves all unique details from both. Example: "webhook drops 429s" + "webhook also drops 503s" → "webhook drops 429 and 503 responses — needs backoff for both".
+- `{"action": "separate"}` — They're actually distinct despite textual similarity. `_enrich_memory` returns `None`, and `insert_memory` falls through to create a new row.
+
+**Safeguards:**
+- **Enrichment cap** — `metadata.enrichment_count` tracks merges. After 5, LLM merge is skipped (prevents memories from growing endlessly).
+- **Content size cap** — If existing content exceeds 1000 characters, LLM merge is skipped.
+- **Timeout** — `merge_or_separate` has a 30-second timeout, much shorter than extraction's 120s.
+- **Graceful fallback** — If the LLM call fails, the deterministic merge still applies (bump importance, union tags, merge metadata, leave content unchanged).
+- **`llm_merge` flag** — The `remember` MCP tool passes `llm_merge=False` so explicit tool calls don't block on a background LLM call. Auto-extracted memories from hooks use `llm_merge=True`.
+
+### Access tracking
+
+After enrichment, the existing memory's `access_count` is bumped. This reflects that the topic kept coming up, even though no new row was created.
 
 ---
 
@@ -251,4 +277,7 @@ The hook returns immediately; the extraction runs independently. One side effect
 | SQLite busy_timeout | 5000ms | `db.py` | 5s retry window for write contention |
 | Max code summary | 2000 chars | `code_intel.py` | Keeps the extraction prompt manageable |
 | Max symbols | 50 | `code_intel.py` | Prevents huge codebases from dominating the prompt |
+| Merge timeout | 30s | `extract.py` | Shorter than extraction — merge is a simpler LLM call |
+| Enrichment cap | 5 merges | `db.py` | Prevents memories from growing endlessly via repeated merges |
+| Content size cap | 1000 chars | `db.py` | Large memories skip LLM merge to stay focused |
 | Schema version | 2 | `db.py` | v1: base schema, v2: added embeddings + vec table |
