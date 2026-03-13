@@ -1,0 +1,24 @@
+[project]
+name = "central-brain"
+version = "0.1.0"
+description = "MCP Memory Server for Claude Code — persistent brain across sessions"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "pydantic>=2.0.0",
+    "sqlite-vec>=0.1.6",
+    "voyageai>=0.3.0",
+    "numpy>=1.26.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+]
+
+[project.scripts]
+central-brain = "central_brain.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/central_brain"]
